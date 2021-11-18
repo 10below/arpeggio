@@ -1,0 +1,298 @@
+---
+title: "Cyclistic Case Study 1"
+author: "Jeroen Riedstra"
+date: "11/16/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#install.packages("plyr")
+#install.packages("anytime")
+library(plyr)
+library(anytime)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+```
+
+## Introduction to case study
+
+Cyclistic offers a bike-sharing service since 2016. They offer single and day passes (referred to as casual riders) as well as annual memberships (reffered to as members). As members are more profitable the company wants to find out how casual and member customers are using the service differently.
+
+For this purpose historical bike trip data is made available for analysis.
+
+The Ask question is: how do annual members and casual riders use Cyclistic bikes differently? These insights may be useful input towards a marketing campaign which aims to convert casual riders to annual memberships.
+
+
+## Importing the data
+
+The trip data is made available on https://divvy-tripdata.s3.amazonaws.com/index.html
+The trip data is organized in monthly (zipped) csv files from April 2020, and in quarterly files before that.
+The assignment states to perform the analysis on the past 12 months, for this reason I am looking at the files from November 2020 - October 2021.
+
+
+To have a quick look at the data, I downloaded and unzipped the smallest one month file of the last 12 months and imported this in Google Sheets, allowing me to do quick sorting, filtering and creation of some quick pivot tables.
+
+For all files I am using RStudio on my own laptop. I downloaded the 12 zip files to the Downloads folder on my laptop prior to starting.
+
+I found the solution extracting and importing multiple CSV files by using the plyr package, see the following link for a full description:
+https://stackoverflow.com/questions/41954183/how-can-i-extract-multiple-zip-files-and-read-those-csvs-in-r
+
+```{r import trip data, results = "hide"} 
+
+# setwd("./Downloads") #set the working directory to the folder where the zip files are downloaded to if needed
+zip_files <- list.files(path = ".", pattern = "*.zip", full.names = TRUE) #get all the zip files
+ldply(.data = zip_files, .fun = unzip) #unzip all the files to the same directory
+csv_files <- list.files(path = ".", pattern = "*-divvy-tripdata.csv") #get the csv files
+trip_data <- ldply(.data = csv_files, .fun=read.csv) #read the csv files
+
+```
+
+
+```{r show columns and datatypes}
+
+str(trip_data)
+
+```
+
+So we have 5.378.834 observations.
+
+As can be seen the trip data fields are:
+
+ride_id : A unique identifier for the trip
+rideable_type : The type of bicyle (Classic, Docked, Electric)
+started_at : Datetime of when the trip started
+ended_at : Datetime of when the trip ended
+start_station_name : The name of the dock station where the trip started
+start_station_id : The ID of the dock station where the trip started
+end_station_name, end_station_id : Same for where the trip ended
+start_lat, start_lng : The GPS coordinates of the trip start
+end_lat, end_lng : The GPS coordinates of the trip end
+member_casual : Membership type (casual or member)
+
+With this provided data, we are able to conduct analysis on the trips, and looking at differences for member_casual.
+
+It should be noted that we do not have information about the riders themselves, which would be very helpful for further analysis.
+
+### Observations about data types
+
+The data types look correct except for the started_at and ended_at fields which are showing as characters but are date time fields. I will convert these to datetime using the package anytime (pointed in this direction via google search)
+
+```{r convert datetime}
+
+trip_data$started_at <- anytime(trip_data$started_at)
+trip_data$ended_at <- anytime(trip_data$ended_at)
+
+str(trip_data)
+
+```
+
+### Observations about data population
+
+The rideable_type field shows three types of bikes: classic, docked and electric. I found a forum post explaining that docked was later renamed to classic. For this reason I will change rows with docked to the new name of classic.
+
+```{r change docked to classic}
+
+trip_data <- trip_data %>%
+  mutate(rideable_type = ifelse(as.character(rideable_type) == "docked_bike", "classic_bike", as.character(rideable_type)))
+
+```
+
+
+### Addition of helpful calculated columns
+
+I add a column for the trip duration which is the difference between the end and start datetime, to make duration analysis easier
+
+```{r create duration column}
+
+trip_data <- trip_data %>%
+  mutate(duration = ended_at - started_at)
+
+```
+
+I add a column that shows the start hour of the datetime. This will make it easier to show trips by the hour of the day the trip started.
+
+```{r}
+
+trip_data <- trip_data %>%
+  mutate(started_hour = format(as.POSIXct(trip_data$started_at), format = "%H"))
+
+```
+
+I add columns that shows the day of the week of started_at. This will make it easier to spot trends based on the day of the week the trip was started.
+I use the function wday for this from the lubridate package.Starting the week on Monday means values 1-5 are Mon-Fri and 6-7 is Sat-Sun.
+Secondly this will be used to create a column that shows weekday (Mon-Fri) or weekend (Sat-Sun).
+
+```{r create weekday columns}
+
+trip_data <- trip_data %>%
+  mutate(day_of_week_started = wday(trip_data$started_at, week_start = 1))
+
+trip_data <- trip_data %>%
+  mutate(weekday = ifelse(day_of_week_started >= 6, "weekend", "weekday"))
+
+```
+
+Lastly, I add a column that shows the year and month of the started_at. This will make it easier to create bar chart totals bucketed by month.
+
+```{r create year month}
+
+trip_data <- trip_data %>%
+  mutate(year_month_started = format(as.POSIXct(trip_data$started_at), format = "%Y%m"))
+
+```
+
+Show the resulting columns:
+
+```{r}
+
+head(trip_data)
+
+```
+
+### Analysis of the duration field
+
+I did some analysis on the duration field and found three anomalies that I wanted to deal with upfront:
+
+- Trips with a negative duration
+- Trips with a (very) short duration
+- Trips with a (very) long duration
+
+By using some basic filtering stats on the duration field I found that over 98% of trips have a duration of over 2 minutes but less than 1 hour.
+
+Without having further information about the data I will assume that trips with a negative duration are recorded in error, and trips with a very short duration are either recorded in error or are trips from customers that decided to not take a trip with the bike, or maybe the bike was broken or had a flat and they had to stop their trip with that bike right away. Both will be filtered out prior to further analysis.
+
+In addition, very few trips have a duration of more than 4 hours. Likely these are either planned day trips, overnight trips where a bike is taken in the evening and returned in the mornign, or where something went wrong in returning the bike. These will also be filtered out prior to further analysis as these would really skew statistics like average duration.
+
+Ideally these records could be examined further to make a better assessment on how to treat them, but as they account for a very small trip volume I am confident it will only make analysis of the vast majority of trips easier to interpret.
+
+```{r filter duration}
+trip_data <- filter(trip_data, duration > 120 & duration <= 14400)
+```
+
+## Plots
+
+Let's show a plot of the number of trips by month by member-casual.
+
+I found some good answers on how to display scaled values on the Y axis (trips in thousands) and X axis (show all values):
+https://stackoverflow.com/questions/47667994/ggplot-x-axis-labels-with-all-x-axis-values
+https://www.tutorialspoint.com/how-to-represent-all-values-of-x-axis-or-y-axis-on-the-graph-in-r-using-ggplot2-package
+
+```{r plot of trips by month by member type}
+
+ggplot(data=trip_data, aes(fill=member_casual, x=year_month_started)) +
+  geom_bar(position="dodge", stat="count") +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(y = "trips", x = "month", fill = "type")
+
+```
+
+I draw the following conclusions from the above chart:
+- Trip volumes are increasing, but also 
+- There seem to be seasonal influences, with fewer trips taken in the winter months, and more in the summer months, probably due to weather conditions
+- Casual trip volumes are higher than member trip volumes in the summer months, which may make sense due to the weather and vacationing
+
+It seems to me that a marketing campaign should try to seek out the customers that are using the bicycles outside of the summer months, where it is more likely that these are really taken for incidental rather than regular use.
+
+### Plot by bike type
+
+```{r plot bike type}
+
+#bar chart by type of bicycle over last 12 months
+ggplot(data=trip_data, aes(fill=rideable_type, x=year_month_started)) +
+  geom_bar(position="dodge", stat="count") +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(y = "trips", x = "month") +
+  scale_fill_discrete(name="bike", labels = c("classic","electric")) +
+  facet_wrap(~member_casual)
+
+```
+
+No conclusions can be drawn on differences between member and casual riders. Classic bikes are more used than electric, but electric seems to be gaining in popularity.
+
+
+### Plot by day of week
+
+```{r plot day of week}
+
+ggplot(data=trip_data, aes(fill=member_casual, x=factor(day_of_week_started))) +
+  geom_bar(position="dodge", stat="count") +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  labs(y = "trips", x = "day of week") +
+  scale_fill_discrete(name="type")
+
+```
+
+Where 1-5 are Monday through Friday, and 6-7 are Saturday-Sunday. As is somewhat expected there are more casual than member trips on weekends, and on weekdays there are more member trips. 
+
+It seems to me a marketing campaign should seek out customers who are taking the bicycles on weekdays, as they are more likely to use them on some regular basis than the ones taken on weekends.
+
+
+### Plot by time of day
+
+```{r plot by time of day}
+
+ggplot(data=trip_data, aes(fill=member_casual, x=started_hour)) +
+  geom_bar(position="stack", stat="count") +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  labs(y = "trips", x = "hour of day") +
+  scale_fill_discrete(name="type")
+
+```
+
+Patterns are similar for casual and member types, with volumes increasing during business hours and peaking towards the end of the afternoon. 
+
+It seems to me that a marketing campaign can seek out the casual customers who are taking the bicycle in the daytime, as these are less likely to be casual trips.
+
+
+### Plot of duration
+
+```{r plot duration}
+
+ggplot(data=trip_data, aes(duration)) +
+  geom_histogram(binwidth = 300) + # set binwidth to 5 minutes = 300 seconds
+  xlim(0, 3600) +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  facet_wrap(~member_casual)
+
+```
+As can be seen the durations are fairly similar for both casual and member trips, peaking somewhere around the 10-15 minute mark. These seem to indicate fairly targeted rather than casual trips.
+
+I would try to seek out the casual customers taking these shorter trips as these are more likely to be potential regular commuters.
+
+
+### Top 10 of start stations for casual riders
+
+To target stations or areas where casual riders are with a profile that looks like member riders, I decide to create a top 10 of start stations with some basic filtering applied to the trip data, by only looking at weekdays, business hours and trips of less than 45 minutes.
+
+```{r start stations}
+
+start_stations <- trip_data %>%
+  filter(start_station_name != "") %>% #filter out where start station name is blank
+  filter(as.integer(started_hour) >= 8 & as.integer(started_hour) <= 18) %>% #filter on business hours
+  filter(weekday == "weekday") %>% #filter on business days
+  filter(duration <= 2700) %>% #filter on trips less than 45 minutes
+  filter(member_casual == "casual") %>% #filter on casual riders only
+  group_by(start_station_name) %>%
+  tally(sort = TRUE) %>%
+  ungroup() %>%
+  arrange(desc(n))
+head(start_stations, 10)
+
+```
+
+The above list can be  used to target campaigns to the highest volume stations.
+
+It should be noted that not all trips have a start or end station as not all bikes need to be docked at a statopm. Further analysis could be done using the supplied GPS coordinates rather than the station names. 
+
+
+
+
